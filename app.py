@@ -1,342 +1,418 @@
 """
-Football Betting Analyzer - Web Interface
-Application Flask avec interface mobile responsive
+app.py
+Interface web Streamlit pour BRVM Bot Ultimate
+Version équilibrée : moderne, intuitive, fonctionnalités essentielles
 """
 
-from flask import Flask, render_template, request, jsonify
-import requests
-import math
-import os
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-import json
+import sys
 
-app = Flask(__name__)
+# Ajouter le chemin pour importer le bot
+sys.path.insert(0, str(Path(__file__).parent))
 
-# --- CONFIGURATION ---
-API_KEY = os.getenv('FOOTBALL_API_KEY', '3506889e741b493eacc1d7792f1200d4')
-HEADERS = {'X-Auth-Token': API_KEY}
-BASE_URL = "https://api.football-data.org/v4"
+from brvm_bot_ultimate import (
+    load_brvm_data,
+    AnalyseurBRVM,
+    expliquer_signal,
+    calculer_rsi,
+    calculer_moyennes_mobiles
+)
 
-# Paramètres par défaut (modifiables via l'interface)
-DEFAULT_CONFIG = {
-    'facteur_domicile': 1.10,
-    'max_buts': 10,
-    'marge_value_bet': 1.05,
-    'commission_exchange': 0.02,
-    'competition': 'PL'
-}
+# ============================================================================
+# CONFIGURATION DE LA PAGE
+# ============================================================================
 
-# --- FONCTIONS DE CALCUL ---
+st.set_page_config(
+    page_title="BRVM Bot Ultimate",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def calcul_poisson(lmbda: float, k: int) -> float:
-    """Calcule la probabilité de Poisson"""
-    if lmbda < 0:
-        return 0
-    try:
-        return (math.pow(lmbda, k) * math.exp(-lmbda)) / math.factorial(k)
-    except:
-        return 0
+# CSS personnalisé
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+    }
+    .buy-strong {
+        background-color: #ff4444;
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 5px;
+        font-weight: bold;
+    }
+    .buy {
+        background-color: #00C851;
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 5px;
+        font-weight: bold;
+    }
+    .watch {
+        background-color: #ffbb33;
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 5px;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# ============================================================================
+# FONCTION DE CHARGEMENT DES DONNÉES (AVEC CACHE)
+# ============================================================================
 
-def get_data(competition: str = "PL") -> Tuple[Optional[List], Optional[List]]:
-    """Récupère les données du classement et des matchs"""
-    try:
-        url_standings = f"{BASE_URL}/competitions/{competition}/standings"
-        url_matches = f"{BASE_URL}/competitions/{competition}/matches?status=SCHEDULED"
-        
-        standings = requests.get(url_standings, headers=HEADERS, timeout=10).json()['standings'][0]['table']
-        matches = requests.get(url_matches, headers=HEADERS, timeout=10).json()['matches']
-        
-        return standings, matches
-    except Exception as e:
-        print(f"Erreur API : {e}")
+@st.cache_data(ttl=3600)  # Cache pendant 1h
+def charger_donnees():
+    """Charge et analyse les données BRVM"""
+    df = load_brvm_data()
+    if df is None:
         return None, None
+    
+    analyseur = AnalyseurBRVM(capital=1000000)
+    resultats = analyseur.analyser(df)
+    
+    return df, resultats
 
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 
-def calculer_probs(s_dom: Dict, s_ext: Dict, moy_buts: float, config: Dict) -> Optional[Dict]:
-    """Calcule les probabilités avec configuration personnalisée"""
-    if s_dom['playedGames'] == 0 or s_ext['playedGames'] == 0:
-        return None
+with st.sidebar:
+    st.image("https://via.placeholder.com/300x100/1f77b4/ffffff?text=BRVM+BOT", use_container_width=True)
+    st.markdown("### ⚙️ Configuration")
     
-    facteur_domicile = config.get('facteur_domicile', 1.10)
-    max_buts = config.get('max_buts', 10)
+    capital = st.number_input(
+        "💰 Capital disponible (FCFA)",
+        min_value=100000,
+        max_value=100000000,
+        value=1000000,
+        step=100000,
+        format="%d"
+    )
     
-    # Lambdas
-    att_dom = s_dom['goalsFor'] / s_dom['playedGames']
-    def_ext = s_ext['goalsAgainst'] / s_ext['playedGames']
-    att_ext = s_ext['goalsFor'] / s_ext['playedGames']
-    def_dom = s_dom['goalsAgainst'] / s_dom['playedGames']
+    st.markdown("---")
+    st.markdown("### 📊 Filtres")
     
-    l_dom = (att_dom / moy_buts) * def_ext * facteur_domicile if moy_buts > 0 else att_dom * facteur_domicile
-    l_ext = (att_ext / moy_buts) * def_dom if moy_buts > 0 else att_ext
+    signal_filter = st.multiselect(
+        "Filtrer par signal",
+        ["🔥 ACHAT FORT", "✅ ACHAT", "⚠️ SURVEILLER", "❌ ATTENTE"],
+        default=["🔥 ACHAT FORT", "✅ ACHAT"]
+    )
     
-    # Probabilités
-    p_dom, p_nul, p_ext = 0, 0, 0
-    score_max_prob = 0
-    score_probable = "1-1"
+    score_min = st.slider("Score minimum", 0, 10, 0)
     
-    for d in range(max_buts):
-        for e in range(max_buts):
-            prob = calcul_poisson(l_dom, d) * calcul_poisson(l_ext, e)
+    st.markdown("---")
+    st.markdown("### ℹ️ À propos")
+    st.info("""
+    **BRVM Bot Ultimate**
+    
+    Analyse technique avancée de la Bourse Régionale des Valeurs Mobilières (BRVM).
+    
+    Développé par **Les Bullionaires** 🏆
+    """)
+
+# ============================================================================
+# CHARGEMENT DES DONNÉES
+# ============================================================================
+
+df_raw, df_analysis = charger_donnees()
+
+if df_raw is None or df_analysis is None:
+    st.error("❌ Impossible de charger les données. Vérifie que le dossier brvm_data/ existe et contient des fichiers CSV.")
+    st.stop()
+
+# Appliquer les filtres
+if signal_filter:
+    df_filtered = df_analysis[df_analysis['Signal'].isin(signal_filter)]
+else:
+    df_filtered = df_analysis
+
+df_filtered = df_filtered[df_filtered['Score'] >= score_min]
+
+# ============================================================================
+# HEADER
+# ============================================================================
+
+st.markdown('<p class="main-header">📈 BRVM Bot Ultimate</p>', unsafe_allow_html=True)
+st.markdown(f"<p style='text-align: center; color: gray;'>Dernière mise à jour : {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>", unsafe_allow_html=True)
+
+# ============================================================================
+# MÉTRIQUES PRINCIPALES
+# ============================================================================
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "🏢 Entreprises analysées",
+        len(df_analysis),
+        delta=None
+    )
+
+with col2:
+    achats_forts = len(df_analysis[df_analysis['Signal'] == '🔥 ACHAT FORT'])
+    st.metric(
+        "🔥 Opportunités ACHAT FORT",
+        achats_forts,
+        delta=f"{(achats_forts/len(df_analysis)*100):.1f}%"
+    )
+
+with col3:
+    prix_moyen = df_analysis['Prix'].mean()
+    st.metric(
+        "💰 Prix moyen",
+        f"{prix_moyen:,.0f} FCFA",
+        delta=None
+    )
+
+with col4:
+    rsi_moyen = df_analysis['RSI'].mean()
+    st.metric(
+        "📊 RSI moyen",
+        f"{rsi_moyen:.1f}",
+        delta="Neutre" if 40 <= rsi_moyen <= 60 else ("Survendu" if rsi_moyen < 40 else "Surachat")
+    )
+
+st.markdown("---")
+
+# ============================================================================
+# ONGLETS PRINCIPAUX
+# ============================================================================
+
+tab1, tab2, tab3 = st.tabs(["🏆 Top Opportunités", "📊 Analyse Détaillée", "📈 Graphiques"])
+
+# ============================================================================
+# TAB 1: TOP OPPORTUNITÉS
+# ============================================================================
+
+with tab1:
+    st.markdown("### 🏆 Meilleures Opportunités d'Investissement")
+    
+    # Sélecteur du nombre d'opportunités à afficher
+    top_n = st.slider("Nombre d'opportunités à afficher", 5, 20, 10)
+    
+    for idx, row in df_filtered.head(top_n).iterrows():
+        with st.expander(f"**{row['Signal']} - {row['Valeur']}** | Score: {row['Score']}/10", expanded=(idx < 3)):
+            col1, col2, col3 = st.columns([2, 2, 2])
             
-            if prob > score_max_prob:
-                score_max_prob = prob
-                score_probable = f"{d}-{e}"
+            with col1:
+                st.markdown("#### 💰 Informations Prix")
+                st.metric("Prix actuel", f"{row['Prix']:,.0f} FCFA")
+                st.metric("Variation 14j", f"{row['Var_14j_%']:+.2f}%")
+                
+            with col2:
+                st.markdown("#### 📊 Indicateurs Techniques")
+                st.metric("RSI", f"{row['RSI']:.1f}")
+                st.metric("MM20", f"{row['MM20']:,.0f} FCFA")
+                st.metric("MM50", f"{row['MM50']:,.0f} FCFA")
+                
+            with col3:
+                st.markdown("#### 🎯 Position Recommandée")
+                st.metric("Nombre d'actions", f"{row['Nb_Actions']}")
+                st.metric("Montant", f"{row['Montant_FCFA']:,.0f} FCFA")
+                st.metric("Ratio R/R", f"{row['Ratio_RR']:.2f}")
             
-            if d > e: p_dom += prob
-            elif d == e: p_nul += prob
-            else: p_ext += prob
-    
-    total = p_dom + p_nul + p_ext
-    if total > 0:
-        p_dom, p_nul, p_ext = p_dom/total, p_nul/total, p_ext/total
-    
-    return {
-        'p_dom': p_dom,
-        'p_nul': p_nul,
-        'p_ext': p_ext,
-        'lambda_dom': l_dom,
-        'lambda_ext': l_ext,
-        'score_probable': score_probable,
-        'cote_juste_dom': 1/p_dom if p_dom > 0 else 999,
-        'cote_juste_nul': 1/p_nul if p_nul > 0 else 999,
-        'cote_juste_ext': 1/p_ext if p_ext > 0 else 999
-    }
+            # Explication détaillée
+            st.markdown("#### 💡 Analyse")
+            explication = expliquer_signal(row)
+            st.info(explication)
+            
+            # Risk Management
+            st.markdown("#### 🛡️ Gestion du Risque")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Stop Loss", f"{row['Stop_Loss']:,.0f} FCFA", delta="-5%")
+            with col2:
+                st.metric("Take Profit", f"{row['Take_Profit']:,.0f} FCFA", delta="+10%")
+            with col3:
+                st.metric("Trailing Stop", f"{row['Trailing_Stop']:,.0f} FCFA", delta="-3%")
 
+# ============================================================================
+# TAB 2: ANALYSE DÉTAILLÉE
+# ============================================================================
 
-def calculer_matched_betting(mise_back: float, cote_back: float, cote_lay: float, commission: float) -> Dict:
-    """Calcule le matched betting"""
-    mise_lay = (mise_back * cote_back) / (cote_lay - commission)
-    responsabilite = mise_lay * (cote_lay - 1)
+with tab2:
+    st.markdown("### 📊 Tableau d'Analyse Complet")
     
-    gain_back = mise_back * (cote_back - 1)
-    perte_lay = responsabilite
-    resultat_si_back_gagne = gain_back - perte_lay
+    # Sélection des colonnes à afficher
+    colonnes_affichees = st.multiselect(
+        "Colonnes à afficher",
+        df_filtered.columns.tolist(),
+        default=['Valeur', 'Prix', 'Score', 'Signal', 'RSI', 'Var_14j_%', 'Nb_Actions', 'Montant_FCFA']
+    )
     
-    gain_lay = mise_lay * (1 - commission)
-    resultat_si_back_perd = gain_lay
-    
-    profit_garanti = min(resultat_si_back_gagne, resultat_si_back_perd)
-    
-    return {
-        'mise_lay': mise_lay,
-        'responsabilite': responsabilite,
-        'resultat_si_back_gagne': resultat_si_back_gagne,
-        'resultat_si_back_perd': resultat_si_back_perd,
-        'profit_garanti': profit_garanti,
-        'taux_conversion': (profit_garanti / mise_back) * 100 if mise_back > 0 else 0
-    }
-
-
-# --- ROUTES API ---
-
-@app.route('/')
-def index():
-    """Page d'accueil"""
-    return render_template('index.html')
-
-
-@app.route('/api/predictions', methods=['POST'])
-def get_predictions():
-    """API : Récupère les prévisions pour une compétition"""
-    data = request.json
-    competition = data.get('competition', 'PL')
-    config = data.get('config', DEFAULT_CONFIG)
-    
-    standings, matches = get_data(competition)
-    
-    if not standings or not matches:
-        return jsonify({'error': 'Impossible de récupérer les données'}), 500
-    
-    # Calculer moyenne de buts
-    total_buts = sum(t['goalsFor'] for t in standings)
-    total_matchs = sum(t['playedGames'] for t in standings)
-    moy_buts = total_buts / total_matchs if total_matchs > 0 else 1.4
-    
-    predictions = []
-    
-    for match in matches[:20]:  # Limiter à 20 matchs
-        dom_nom = match['homeTeam']['shortName']
-        ext_nom = match['awayTeam']['shortName']
+    if colonnes_affichees:
+        # Formater le DataFrame pour l'affichage
+        df_display = df_filtered[colonnes_affichees].copy()
         
-        s_dom = next((t for t in standings if t['team']['shortName'] == dom_nom), None)
-        s_ext = next((t for t in standings if t['team']['shortName'] == ext_nom), None)
+        # Appliquer un style conditionnel
+        def highlight_signal(row):
+            if '🔥 ACHAT FORT' in str(row['Signal']):
+                return ['background-color: #ffcccc'] * len(row)
+            elif '✅ ACHAT' in str(row['Signal']):
+                return ['background-color: #ccffcc'] * len(row)
+            elif '⚠️ SURVEILLER' in str(row['Signal']):
+                return ['background-color: #ffffcc'] * len(row)
+            else:
+                return [''] * len(row)
         
-        if not s_dom or not s_ext:
-            continue
+        st.dataframe(
+            df_display.style.apply(highlight_signal, axis=1),
+            use_container_width=True,
+            height=500
+        )
         
-        probs = calculer_probs(s_dom, s_ext, moy_buts, config)
+        # Bouton de téléchargement
+        csv = df_display.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Télécharger en CSV",
+            data=csv,
+            file_name=f'brvm_analyse_{datetime.now().strftime("%Y%m%d")}.csv',
+            mime='text/csv',
+        )
+    
+    st.markdown("---")
+    
+    # Statistiques par signal
+    st.markdown("### 📈 Répartition des Signaux")
+    
+    signal_counts = df_analysis['Signal'].value_counts()
+    
+    fig = px.pie(
+        values=signal_counts.values,
+        names=signal_counts.index,
+        title="Distribution des signaux de trading",
+        color_discrete_sequence=px.colors.qualitative.Set3
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
+# TAB 3: GRAPHIQUES
+# ============================================================================
+
+with tab3:
+    st.markdown("### 📈 Visualisations Graphiques")
+    
+    # Sélection de l'entreprise
+    entreprise = st.selectbox(
+        "Sélectionner une entreprise",
+        df_analysis['Valeur'].unique()
+    )
+    
+    # Filtrer les données de l'entreprise
+    df_entreprise = df_raw[df_raw['Valeur'] == entreprise].copy()
+    df_entreprise = df_entreprise.sort_values('Date')
+    
+    if len(df_entreprise) > 0:
+        # Calculer les indicateurs pour le graphique
+        df_entreprise['RSI'] = calculer_rsi(df_entreprise['Close'], 14)
+        mm20, mm50 = calculer_moyennes_mobiles(df_entreprise['Close'])
+        df_entreprise['MM20'] = mm20
+        df_entreprise['MM50'] = mm50
         
-        if not probs:
-            continue
+        # Graphique du prix avec moyennes mobiles
+        fig1 = go.Figure()
         
-        date_match = datetime.fromisoformat(match['utcDate'].replace('Z', '+00:00'))
+        fig1.add_trace(go.Scatter(
+            x=df_entreprise['Date'],
+            y=df_entreprise['Close'],
+            name='Prix',
+            line=dict(color='blue', width=2)
+        ))
         
-        predictions.append({
-            'match_id': match['id'],
-            'domicile': dom_nom,
-            'exterieur': ext_nom,
-            'date': date_match.strftime('%d/%m/%Y'),
-            'heure': date_match.strftime('%H:%M'),
-            'probabilites': {
-                'domicile': round(probs['p_dom'] * 100, 2),
-                'nul': round(probs['p_nul'] * 100, 2),
-                'exterieur': round(probs['p_ext'] * 100, 2)
-            },
-            'cotes_justes': {
-                'domicile': round(probs['cote_juste_dom'], 2),
-                'nul': round(probs['cote_juste_nul'], 2),
-                'exterieur': round(probs['cote_juste_ext'], 2)
-            },
-            'lambdas': {
-                'domicile': round(probs['lambda_dom'], 2),
-                'exterieur': round(probs['lambda_ext'], 2)
-            },
-            'score_probable': probs['score_probable']
-        })
-    
-    return jsonify({
-        'success': True,
-        'competition': competition,
-        'moy_buts_ligue': round(moy_buts, 2),
-        'nb_matchs': len(predictions),
-        'predictions': predictions
-    })
+        fig1.add_trace(go.Scatter(
+            x=df_entreprise['Date'],
+            y=df_entreprise['MM20'],
+            name='MM20',
+            line=dict(color='orange', width=1, dash='dash')
+        ))
+        
+        fig1.add_trace(go.Scatter(
+            x=df_entreprise['Date'],
+            y=df_entreprise['MM50'],
+            name='MM50',
+            line=dict(color='red', width=1, dash='dash')
+        ))
+        
+        fig1.update_layout(
+            title=f'Évolution du prix - {entreprise}',
+            xaxis_title='Date',
+            yaxis_title='Prix (FCFA)',
+            hovermode='x unified',
+            height=400
+        )
+        
+        st.plotly_chart(fig1, use_container_width=True)
+        
+        # Graphique RSI
+        fig2 = go.Figure()
+        
+        fig2.add_trace(go.Scatter(
+            x=df_entreprise['Date'],
+            y=df_entreprise['RSI'],
+            name='RSI',
+            line=dict(color='purple', width=2)
+        ))
+        
+        # Lignes de référence RSI
+        fig2.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Surachat (70)")
+        fig2.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Survente (30)")
+        
+        fig2.update_layout(
+            title=f'RSI (14 jours) - {entreprise}',
+            xaxis_title='Date',
+            yaxis_title='RSI',
+            hovermode='x unified',
+            height=300
+        )
+        
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Informations actuelles
+        st.markdown("### 📊 Informations Actuelles")
+        
+        info_entreprise = df_analysis[df_analysis['Valeur'] == entreprise].iloc[0]
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Score", f"{info_entreprise['Score']}/10")
+        with col2:
+            st.metric("Signal", info_entreprise['Signal'])
+        with col3:
+            st.metric("Prix actuel", f"{info_entreprise['Prix']:,.0f} FCFA")
+        with col4:
+            st.metric("RSI", f"{info_entreprise['RSI']:.1f}")
 
+# ============================================================================
+# FOOTER
+# ============================================================================
 
-@app.route('/api/analyze_match', methods=['POST'])
-def analyze_match():
-    """API : Analyse détaillée d'un match avec value bet detection"""
-    data = request.json
-    
-    dom = data.get('domicile')
-    ext = data.get('exterieur')
-    cotes_bookmaker = data.get('cotes_bookmaker', {})
-    competition = data.get('competition', 'PL')
-    config = data.get('config', DEFAULT_CONFIG)
-    
-    standings, _ = get_data(competition)
-    
-    if not standings:
-        return jsonify({'error': 'Impossible de récupérer les données'}), 500
-    
-    s_dom = next((t for t in standings if dom.lower() in t['team']['shortName'].lower()), None)
-    s_ext = next((t for t in standings if ext.lower() in t['team']['shortName'].lower()), None)
-    
-    if not s_dom or not s_ext:
-        return jsonify({'error': 'Équipe non trouvée'}), 404
-    
-    total_buts = sum(t['goalsFor'] for t in standings)
-    total_matchs = sum(t['playedGames'] for t in standings)
-    moy_buts = total_buts / total_matchs if total_matchs > 0 else 1.4
-    
-    probs = calculer_probs(s_dom, s_ext, moy_buts, config)
-    
-    if not probs:
-        return jsonify({'error': 'Erreur de calcul'}), 500
-    
-    # Analyse value bets
-    marge = config.get('marge_value_bet', 1.05)
-    value_bets = []
-    
-    issues = ['domicile', 'nul', 'exterieur']
-    cotes_justes = [probs['cote_juste_dom'], probs['cote_juste_nul'], probs['cote_juste_ext']]
-    probas = [probs['p_dom'], probs['p_nul'], probs['p_ext']]
-    
-    for i, issue in enumerate(issues):
-        cote_bm = cotes_bookmaker.get(issue, 0)
-        if cote_bm > 0 and cote_bm > (cotes_justes[i] * marge):
-            valeur = ((cote_bm / cotes_justes[i]) - 1) * 100
-            esperance = (cote_bm * probas[i]) - 1
-            value_bets.append({
-                'issue': issue,
-                'cote_bookmaker': cote_bm,
-                'cote_juste': round(cotes_justes[i], 2),
-                'valeur_pct': round(valeur, 2),
-                'esperance_pct': round(esperance * 100, 2)
-            })
-    
-    return jsonify({
-        'success': True,
-        'match': f"{s_dom['team']['shortName']} vs {s_ext['team']['shortName']}",
-        'statistiques': {
-            'domicile': {
-                'equipe': s_dom['team']['shortName'],
-                'matchs': s_dom['playedGames'],
-                'buts_marques': s_dom['goalsFor'],
-                'buts_encaisses': s_dom['goalsAgainst'],
-                'position': s_dom['position']
-            },
-            'exterieur': {
-                'equipe': s_ext['team']['shortName'],
-                'matchs': s_ext['playedGames'],
-                'buts_marques': s_ext['goalsFor'],
-                'buts_encaisses': s_ext['goalsAgainst'],
-                'position': s_ext['position']
-            }
-        },
-        'probabilites': {
-            'domicile': round(probs['p_dom'] * 100, 2),
-            'nul': round(probs['p_nul'] * 100, 2),
-            'exterieur': round(probs['p_ext'] * 100, 2)
-        },
-        'cotes_justes': {
-            'domicile': round(probs['cote_juste_dom'], 2),
-            'nul': round(probs['cote_juste_nul'], 2),
-            'exterieur': round(probs['cote_juste_ext'], 2)
-        },
-        'lambdas': {
-            'domicile': round(probs['lambda_dom'], 2),
-            'exterieur': round(probs['lambda_ext'], 2)
-        },
-        'score_probable': probs['score_probable'],
-        'value_bets': value_bets,
-        'nb_value_bets': len(value_bets)
-    })
-
-
-@app.route('/api/matched_betting', methods=['POST'])
-def calculate_matched_betting():
-    """API : Calcule le matched betting"""
-    data = request.json
-    
-    mise_back = data.get('mise_back', 5000)
-    cote_back = data.get('cote_back', 2.0)
-    cote_lay = data.get('cote_lay', 2.1)
-    commission = data.get('commission', 0.02)
-    
-    result = calculer_matched_betting(mise_back, cote_back, cote_lay, commission)
-    
-    return jsonify({
-        'success': True,
-        'mise_back': mise_back,
-        'cote_back': cote_back,
-        'cote_lay': cote_lay,
-        'commission': commission * 100,
-        'mise_lay': round(result['mise_lay'], 0),
-        'responsabilite': round(result['responsabilite'], 0),
-        'resultat_si_back_gagne': round(result['resultat_si_back_gagne'], 0),
-        'resultat_si_back_perd': round(result['resultat_si_back_perd'], 0),
-        'profit_garanti': round(result['profit_garanti'], 0),
-        'taux_conversion': round(result['taux_conversion'], 2)
-    })
-
-
-@app.route('/api/config', methods=['GET', 'POST'])
-def manage_config():
-    """Gérer la configuration"""
-    if request.method == 'POST':
-        new_config = request.json
-        # Valider et enregistrer la configuration
-        return jsonify({'success': True, 'config': new_config})
-    else:
-        return jsonify(DEFAULT_CONFIG)
-
-
-if __name__ == '__main__':
-    # Pour développement local
-    app.run(host='0.0.0.0', port=5000, debug=True)
-    
-    # Pour production, utilisez un serveur WSGI comme Gunicorn :
-    # gunicorn -w 4 -b 0.0.0.0:5000 app:app
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: gray; padding: 2rem;'>
+    <p><strong>BRVM Bot Ultimate</strong> - Développé par Les Bullionaires 🏆</p>
+    <p>Analyse technique de la BRVM basée sur RSI, moyennes mobiles et momentum</p>
+    <p style='font-size: 0.8rem;'>⚠️ Ceci n'est pas un conseil en investissement. Toujours faire ses propres recherches.</p>
+</div>
+""", unsafe_allow_html=True)
+                
